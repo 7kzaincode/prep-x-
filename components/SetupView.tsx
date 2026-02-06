@@ -1,8 +1,10 @@
 
 import React from 'react';
 import { Course, UploadedFile, Constraints, DocType } from '../types';
+import { API_BASE_URL } from '../App';
 
 interface SetupViewProps {
+  sessionId: string;
   courses: Course[];
   files: UploadedFile[];
   setFiles: React.Dispatch<React.SetStateAction<UploadedFile[]>>;
@@ -14,28 +16,154 @@ interface SetupViewProps {
   onUpdateCourse: (id: string, updates: Partial<Course>) => void;
 }
 
-const SetupView: React.FC<SetupViewProps> = ({ 
-  courses, 
-  files, 
-  setFiles, 
-  constraints, 
-  setConstraints, 
+const SetupView: React.FC<SetupViewProps> = ({
+  sessionId,
+  courses,
+  files,
+  setFiles,
+  constraints,
+  setConstraints,
   onStart,
   onAddCourse,
   onRemoveCourse,
   onUpdateCourse
 }) => {
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>, courseCode: string, type: DocType) => {
-    if (e.target.files) {
-      const newFiles = Array.from(e.target.files).map((f: File) => ({
-        id: Math.random().toString(36).substr(2, 9),
-        name: f.name,
-        size: f.size,
+  // Check if a course code is a placeholder (e.g., "COURSE 1", "EXAM 101", or empty)
+  const isPlaceholderCode = (code: string): boolean => {
+    if (!code) return true;
+    const normalized = code.trim().toUpperCase();
+    // Match patterns like "COURSE 1", "COURSE 2", "EXAM 101", etc.
+    return /^(COURSE|EXAM)\s*\d*$/i.test(normalized) || normalized === '';
+  };
+
+  // Auto-detect course code from filename (e.g., "PHYS 234 - Syllabus.pdf" -> "PHYS 234")
+  const detectCourseCode = (filename: string): string | null => {
+    // Pattern: Letters followed by numbers, with optional space (e.g., "PHYS 234", "HLTH204", "CS 101")
+    const match = filename.match(/^([A-Z]{2,6}\s*\d{2,4})/i);
+    if (match) {
+      // Normalize: uppercase and ensure single space between letters and numbers
+      return match[1].toUpperCase().replace(/\s+/g, ' ').replace(/([A-Z]+)(\d)/, '$1 $2');
+    }
+    return null;
+  };
+
+  // Auto-detect document type from filename
+  const detectDocType = (filename: string): DocType | null => {
+    const lower = filename.toLowerCase();
+    if (lower.includes('syllabus')) return 'syllabus';
+    if (lower.includes('midterm') || lower.includes('overview') || lower.includes('exam')) return 'midterm_overview';
+    if (lower.includes('textbook') || lower.includes('book') || lower.includes('edition')) return 'textbook';
+    return null;
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, courseId: string, type: DocType) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      const tempId = Math.random().toString(36).substr(2, 9);
+
+      // Auto-detect course code from filename if course code is empty or placeholder
+      const currentCourse = courses.find(c => c.id === courseId);
+      const detectedCode = detectCourseCode(file.name);
+      if (detectedCode && currentCourse && (!currentCourse.code || isPlaceholderCode(currentCourse.code))) {
+        onUpdateCourse(courseId, { code: detectedCode });
+      }
+
+      // Use course ID (immutable) as courseCode for file tracking and server storage
+      const newFile: UploadedFile = {
+        id: tempId,
+        name: file.name,
+        size: file.size,
         type,
-        courseCode,
-        status: 'complete' as const
-      }));
-      setFiles(prev => [...prev, ...newFiles]);
+        courseCode: courseId,
+        status: 'uploading'
+      };
+
+      setFiles(prev => [...prev, newFile]);
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('sessionId', sessionId);
+      formData.append('courseCode', courseId);
+      formData.append('docType', type);
+
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/upload`, {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (response.ok) {
+          const result = await response.json();
+          setFiles(prev => prev.map(f => f.id === tempId ? { ...f, status: 'complete' } : f));
+        } else {
+          setFiles(prev => prev.map(f => f.id === tempId ? { ...f, status: 'error' } : f));
+        }
+      } catch (error) {
+        setFiles(prev => prev.map(f => f.id === tempId ? { ...f, status: 'error' } : f));
+      }
+    }
+  };
+
+  // Folder upload handler - auto-categorizes files and auto-detects course code
+  const handleFolderUpload = async (e: React.ChangeEvent<HTMLInputElement>, courseId: string) => {
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
+
+    const pdfFiles: File[] = [];
+    for (let i = 0; i < fileList.length; i++) {
+      const f = fileList[i];
+      if (f.name.toLowerCase().endsWith('.pdf')) {
+        pdfFiles.push(f);
+      }
+    }
+
+    // Auto-detect course code from first file and update course if empty or placeholder
+    if (pdfFiles.length > 0) {
+      const detectedCode = detectCourseCode(pdfFiles[0].name);
+      const currentCourse = courses.find(c => c.id === courseId);
+      if (detectedCode && currentCourse && (!currentCourse.code || isPlaceholderCode(currentCourse.code))) {
+        onUpdateCourse(courseId, { code: detectedCode });
+      }
+    }
+
+    for (const file of pdfFiles) {
+      const detectedType = detectDocType(file.name);
+      if (!detectedType) continue; // Skip files we can't categorize
+
+      // Skip if we already have this type for this course
+      if (files.some(f => f.courseCode === courseId && f.type === detectedType)) continue;
+
+      const tempId = Math.random().toString(36).substr(2, 9);
+      const newFile: UploadedFile = {
+        id: tempId,
+        name: file.name,
+        size: file.size,
+        type: detectedType,
+        courseCode: courseId,
+        status: 'uploading'
+      };
+
+      setFiles(prev => [...prev, newFile]);
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('sessionId', sessionId);
+      formData.append('courseCode', courseId);
+      formData.append('docType', detectedType);
+
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/upload`, {
+          method: 'POST',
+          body: formData,
+        });
+        if (response.ok) {
+          setFiles(prev => prev.map(f => f.id === tempId ? { ...f, status: 'complete' } : f));
+        } else {
+          setFiles(prev => prev.map(f => f.id === tempId ? { ...f, status: 'error' } : f));
+        }
+      } catch (error) {
+        setFiles(prev => prev.map(f => f.id === tempId ? { ...f, status: 'error' } : f));
+      }
     }
   };
 
@@ -43,13 +171,13 @@ const SetupView: React.FC<SetupViewProps> = ({
     setFiles(prev => prev.filter(f => f.id !== id));
   };
 
-  const isCourseComplete = (code: string) => {
+  const isCourseComplete = (courseId: string) => {
     const types: DocType[] = ['syllabus', 'midterm_overview', 'textbook'];
-    return types.every(t => files.some(f => f.courseCode === code && f.type === t));
+    return types.every(t => files.some(f => f.courseCode === courseId && f.type === t));
   };
 
-  const isReady = courses.length > 0 && courses.every(c => isCourseComplete(c.code));
-  
+  const isReady = courses.length > 0 && courses.every(c => isCourseComplete(c.id));
+
   const totalFilesNeeded = courses.length * 3;
   const currentFilesCount = files.length;
   const missingFilesCount = Math.max(0, totalFilesNeeded - currentFilesCount);
@@ -78,7 +206,7 @@ const SetupView: React.FC<SetupViewProps> = ({
             <h3 className="serif text-2xl font-bold text-gray-300">Your Dashboard is Empty</h3>
             <p className="text-gray-400 text-sm font-medium tracking-wide">Initialize your first course module to begin the mapping process.</p>
           </div>
-          <button 
+          <button
             onClick={onAddCourse}
             className="px-8 py-4 bg-[#4a5d45] text-white rounded-2xl text-[10px] font-black uppercase tracking-[0.3em] hover:shadow-xl hover:-translate-y-1 transition-all"
           >
@@ -89,7 +217,7 @@ const SetupView: React.FC<SetupViewProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10">
           {courses.map(course => (
             <div key={course.id} className="group relative bg-white border border-gray-100 rounded-[3rem] p-10 shadow-sm hover:shadow-2xl transition-all duration-700 hover:-translate-y-2">
-              <button 
+              <button
                 onClick={() => onRemoveCourse(course.id)}
                 className="absolute top-8 right-8 p-2.5 rounded-full hover:bg-red-50 text-gray-200 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 z-10"
               >
@@ -97,37 +225,47 @@ const SetupView: React.FC<SetupViewProps> = ({
               </button>
 
               <div className="space-y-4 mb-10">
-                <input 
+                <input
                   className="serif text-3xl font-bold text-[#4a5d45] w-full bg-transparent focus:outline-none border-b border-transparent focus:border-[#a7b8a1]/20 transition-all placeholder:opacity-20"
                   value={course.code}
                   onChange={e => onUpdateCourse(course.id, { code: e.target.value })}
                   placeholder="EXAM 101"
                 />
-                <input 
+                <input
                   className="text-xs font-bold uppercase tracking-[0.2em] text-gray-400 w-full bg-transparent focus:outline-none placeholder:opacity-20"
                   value={course.name}
                   onChange={e => onUpdateCourse(course.id, { name: e.target.value })}
                   placeholder="Module Description"
                 />
                 <div className="flex items-center gap-4 pt-4">
-                  <span className="text-[9px] font-black uppercase tracking-[0.4em] text-gray-300">Target</span>
-                  <input 
+                  <span className="text-[9px] font-black uppercase tracking-[0.4em] text-gray-300">Exam Date</span>
+                  <input
                     type="date"
                     className="text-[10px] font-mono font-bold bg-[#fdfdfb] px-4 py-2 rounded-full border border-gray-100 text-[#4a5d45] focus:outline-none focus:ring-2 focus:ring-[#4a5d45]/10 shadow-sm"
                     value={course.examDate}
                     onChange={e => onUpdateCourse(course.id, { examDate: e.target.value })}
                   />
+                  {course.examDate && (
+                    <button
+                      onClick={() => onUpdateCourse(course.id, { examDate: '' })}
+                      className="text-[8px] font-black uppercase tracking-[0.2em] text-gray-300 hover:text-red-400 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                  {!course.examDate && (
+                    <span className="text-[8px] font-bold italic text-gray-300">Auto-detected from midterm</span>
+                  )}
                 </div>
               </div>
 
               <div className="space-y-4">
                 {(['syllabus', 'midterm_overview', 'textbook'] as DocType[]).map(type => {
-                  const existingFile = files.find(f => f.courseCode === course.code && f.type === type);
+                  const existingFile = files.find(f => f.courseCode === course.id && f.type === type);
                   return (
                     <div key={type} className="relative">
-                      <label className={`block w-full text-left p-5 rounded-3xl border transition-all cursor-pointer ${
-                        existingFile ? 'bg-[#4a5d45]/5 border-[#4a5d45]/10 shadow-inner' : 'bg-[#fdfdfb] border-gray-50 hover:border-[#a7b8a1] hover:bg-white shadow-sm'
-                      }`}>
+                      <label className={`block w-full text-left p-5 rounded-3xl border transition-all cursor-pointer ${existingFile ? 'bg-[#4a5d45]/5 border-[#4a5d45]/10 shadow-inner' : 'bg-[#fdfdfb] border-gray-50 hover:border-[#a7b8a1] hover:bg-white shadow-sm'
+                        }`}>
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-5">
                             <div className={`p-3 rounded-2xl transition-all duration-500 ${existingFile ? 'bg-[#4a5d45] text-white shadow-xl shadow-[#4a5d45]/30' : 'bg-white text-gray-200 border border-gray-50'}`}>
@@ -147,7 +285,7 @@ const SetupView: React.FC<SetupViewProps> = ({
                             </div>
                           </div>
                           {existingFile && (
-                            <button 
+                            <button
                               onClick={(e) => { e.preventDefault(); removeFile(existingFile.id); }}
                               className="p-2.5 hover:bg-white rounded-full text-gray-300 hover:text-red-400 transition-all shadow-sm"
                             >
@@ -155,22 +293,40 @@ const SetupView: React.FC<SetupViewProps> = ({
                             </button>
                           )}
                         </div>
-                        <input 
-                          type="file" 
-                          className="hidden" 
+                        <input
+                          type="file"
+                          className="hidden"
                           accept=".pdf"
-                          onChange={(e) => handleFileUpload(e, course.code, type)}
+                          onChange={(e) => handleFileUpload(e, course.id, type)}
                           disabled={!!existingFile}
                         />
                       </label>
                     </div>
                   );
                 })}
+
+                {/* Folder upload button */}
+                <label className="block w-full text-center p-4 rounded-2xl border-2 border-dashed border-gray-100 hover:border-[#4a5d45] hover:bg-[#4a5d45]/5 transition-all cursor-pointer group mt-4">
+                  <div className="flex items-center justify-center gap-3">
+                    <svg className="w-5 h-5 text-gray-300 group-hover:text-[#4a5d45] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                    </svg>
+                    <span className="text-[9px] font-black uppercase tracking-[0.2em] text-gray-300 group-hover:text-[#4a5d45] transition-colors">Upload Folder</span>
+                  </div>
+                  <p className="text-[8px] text-gray-300 mt-1">Auto-detects syllabus, overview, textbook</p>
+                  <input
+                    type="file"
+                    className="hidden"
+                    accept=".pdf"
+                    multiple
+                    onChange={(e) => handleFolderUpload(e, course.id)}
+                  />
+                </label>
               </div>
             </div>
           ))}
 
-          <button 
+          <button
             onClick={onAddCourse}
             className="flex flex-col items-center justify-center p-12 rounded-[3rem] border-2 border-dashed border-gray-100 text-gray-200 hover:border-[#a7b8a1] hover:text-[#4a5d45] transition-all group min-h-[450px] hover:bg-white/50"
           >
@@ -184,7 +340,7 @@ const SetupView: React.FC<SetupViewProps> = ({
 
       <div className="bg-[#f8f9f7] rounded-[4rem] p-20 max-w-5xl mx-auto space-y-20 border border-gray-100 shadow-sm relative overflow-hidden">
         <div className="absolute top-0 right-0 w-64 h-64 bg-[#4a5d45]/5 rounded-full blur-[100px] -translate-y-1/2 translate-x-1/2"></div>
-        
+
         <div className="text-center space-y-6 relative z-10">
           <h3 className="serif text-5xl font-bold text-[#4a5d45]">Operational Boundaries.</h3>
           <p className="text-gray-400 font-medium text-lg max-w-md mx-auto leading-relaxed">Quantify your temporal constraints for the agent scheduling algorithm.</p>
@@ -197,11 +353,11 @@ const SetupView: React.FC<SetupViewProps> = ({
               <span className="serif text-4xl font-bold text-[#4a5d45]">{constraints.weekdayHours}<span className="text-sm ml-1.5 opacity-40 italic font-medium">H</span></span>
             </div>
             <div className="relative pt-2">
-              <input 
-                type="range" min="1" max="12" 
+              <input
+                type="range" min="1" max="12"
                 value={constraints.weekdayHours}
-                onChange={e => setConstraints({...constraints, weekdayHours: parseInt(e.target.value)})}
-                className="w-full accent-[#4a5d45] h-2.5 bg-gray-200 rounded-full appearance-none cursor-pointer" 
+                onChange={e => setConstraints({ ...constraints, weekdayHours: parseInt(e.target.value) })}
+                className="w-full accent-[#4a5d45] h-2.5 bg-gray-200 rounded-full appearance-none cursor-pointer"
               />
               <div className="flex justify-between mt-4 px-1">
                 {[2, 4, 6, 8, 10, 12].map(v => <span key={v} className="text-[9px] font-black text-gray-300">{v}</span>)}
@@ -214,11 +370,11 @@ const SetupView: React.FC<SetupViewProps> = ({
               <span className="serif text-4xl font-bold text-[#4a5d45]">{constraints.weekendHours}<span className="text-sm ml-1.5 opacity-40 italic font-medium">H</span></span>
             </div>
             <div className="relative pt-2">
-              <input 
-                type="range" min="1" max="16" 
+              <input
+                type="range" min="1" max="16"
                 value={constraints.weekendHours}
-                onChange={e => setConstraints({...constraints, weekendHours: parseInt(e.target.value)})}
-                className="w-full accent-[#4a5d45] h-2.5 bg-gray-200 rounded-full appearance-none cursor-pointer" 
+                onChange={e => setConstraints({ ...constraints, weekendHours: parseInt(e.target.value) })}
+                className="w-full accent-[#4a5d45] h-2.5 bg-gray-200 rounded-full appearance-none cursor-pointer"
               />
               <div className="flex justify-between mt-4 px-1">
                 {[4, 8, 12, 16].map(v => <span key={v} className="text-[9px] font-black text-gray-300">{v}</span>)}
@@ -226,16 +382,15 @@ const SetupView: React.FC<SetupViewProps> = ({
             </div>
           </div>
         </div>
-        
+
         <div className="pt-10 flex flex-col items-center gap-10 relative z-10">
-          <button 
+          <button
             onClick={onStart}
             disabled={!isReady}
-            className={`px-24 py-7 rounded-full text-[12px] font-black uppercase tracking-[0.5em] transition-all shadow-2xl ${
-              isReady 
-              ? 'bg-[#4a5d45] text-white hover:scale-105 active:scale-95 shadow-[#4a5d45]/40 hover:bg-[#3d4d38]' 
+            className={`px-24 py-7 rounded-full text-[12px] font-black uppercase tracking-[0.5em] transition-all shadow-2xl ${isReady
+              ? 'bg-[#4a5d45] text-white hover:scale-105 active:scale-95 shadow-[#4a5d45]/40 hover:bg-[#3d4d38]'
               : 'bg-gray-100 text-gray-300 cursor-not-allowed shadow-none'
-            }`}
+              }`}
           >
             Initiate Orchestration
           </button>

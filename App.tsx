@@ -7,8 +7,10 @@ import PlanningView from './components/PlanningView';
 import ResultsView from './components/ResultsView';
 
 const COURSE_COLORS = ['#4a5d45', '#8c7851', '#51688c', '#8c5151', '#518c86'];
+export const API_BASE_URL = 'http://localhost:8000';
 
 const App: React.FC = () => {
+  const [sessionId] = useState<string>(() => Math.random().toString(36).substr(2, 9));
   const [currentView, setCurrentView] = useState<ViewState>('setup');
   const [courses, setCourses] = useState<Course[]>([]);
   const [files, setFiles] = useState<UploadedFile[]>([]);
@@ -71,7 +73,7 @@ const App: React.FC = () => {
       currentDate.setDate(today.getDate() + i);
       const dateStr = currentDate.toISOString().split('T')[0];
       const course = demoCourses[i % demoCourses.length];
-      
+
       demoPlan.push({
         date: dateStr,
         course: course.code,
@@ -92,28 +94,23 @@ const App: React.FC = () => {
 
   const addCourse = () => {
     const newId = Math.random().toString(36).substr(2, 9);
-    setCourses([...courses, { 
-      id: newId, 
-      code: `COURSE ${courses.length + 1}`, 
-      name: 'Enter Course Name', 
-      examDate: new Date(2026, 1, 27).toISOString().split('T')[0],
+    setCourses([...courses, {
+      id: newId,
+      code: `COURSE ${courses.length + 1}`,
+      name: 'Enter Course Name',
+      examDate: '',
       color: COURSE_COLORS[courses.length % COURSE_COLORS.length]
     }]);
   };
 
   const removeCourse = (id: string) => {
-    const courseToRemove = courses.find(c => c.id === id);
-    if (courseToRemove) {
-      setCourses(courses.filter(c => c.id !== id));
-      setFiles(files.filter(f => f.courseCode !== courseToRemove.code));
-    }
+    setCourses(courses.filter(c => c.id !== id));
+    // Files use course.id as courseCode, so filter by id directly
+    setFiles(files.filter(f => f.courseCode !== id));
   };
 
   const updateCourse = (id: string, updates: Partial<Course>) => {
-    const oldCourse = courses.find(c => c.id === id);
-    if (oldCourse && updates.code && updates.code !== oldCourse.code) {
-      setFiles(files.map(f => f.courseCode === oldCourse.code ? { ...f, courseCode: updates.code! } : f));
-    }
+    // No need to update files on code rename — files use immutable course.id
     setCourses(courses.map(c => c.id === id ? { ...c, ...updates } : c));
   };
 
@@ -126,7 +123,7 @@ const App: React.FC = () => {
               <Logo />
             </button>
             {currentView === 'setup' && (
-              <button 
+              <button
                 onClick={loadDemoData}
                 className="text-[9px] font-black uppercase tracking-[0.3em] text-[#a7b8a1] hover:text-[#4a5d45] transition-colors border border-[#a7b8a1]/20 px-4 py-2 rounded-full hidden sm:block"
               >
@@ -134,7 +131,7 @@ const App: React.FC = () => {
               </button>
             )}
           </div>
-          
+
           <div className="flex items-center gap-6">
             <div className="hidden md:flex items-center gap-8 text-[11px] font-bold uppercase tracking-[0.2em] text-gray-400">
               <span className={`transition-colors ${currentView === 'setup' ? 'text-[#4a5d45]' : ''}`}>01. Setup</span>
@@ -147,9 +144,10 @@ const App: React.FC = () => {
 
       <main className="flex-1 max-w-6xl mx-auto w-full p-6 py-12">
         {currentView === 'setup' && (
-          <SetupView 
-            courses={courses} 
-            files={files} 
+          <SetupView
+            sessionId={sessionId}
+            courses={courses}
+            files={files}
             setFiles={setFiles}
             constraints={constraints}
             setConstraints={setConstraints}
@@ -160,11 +158,12 @@ const App: React.FC = () => {
           />
         )}
         {currentView === 'planning' && (
-          <PlanningView 
-            onComplete={handlePlanningComplete} 
-            files={files} 
+          <PlanningView
+            sessionId={sessionId}
+            onComplete={handlePlanningComplete}
+            files={files}
             courses={courses}
-            constraints={constraints} 
+            constraints={constraints}
           />
         )}
         {currentView === 'results' && (

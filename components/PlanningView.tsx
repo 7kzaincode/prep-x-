@@ -1,89 +1,158 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { AgentLog, Constraints, UploadedFile, StudyTask, Course } from '../types';
+import { API_BASE_URL } from '../App';
 
 interface PlanningViewProps {
+  sessionId: string;
   onComplete: (plan: StudyTask[]) => void;
   files: UploadedFile[];
   courses: Course[];
   constraints: Constraints;
 }
 
-const PlanningView: React.FC<PlanningViewProps> = ({ onComplete, files, courses, constraints }) => {
+const AGENT_COLORS: Record<string, string> = {
+  SyllabusExpert: 'text-blue-400',
+  ExamScopeAnalyst: 'text-emerald-400',
+  StudyGuideGuru: 'text-amber-400',
+  ChiefOrchestrator: 'text-purple-400',
+  System: 'text-slate-400',
+};
+
+const PlanningView: React.FC<PlanningViewProps> = ({ sessionId, onComplete, files, courses, constraints }) => {
   const [logs, setLogs] = useState<AgentLog[]>([]);
   const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const terminalRef = useRef<HTMLDivElement>(null);
+  const startedRef = useRef(false);
+
+  // Auto-scroll terminal to bottom when new logs arrive
+  useEffect(() => {
+    if (terminalRef.current) {
+      terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
+    }
+  }, [logs]);
 
   useEffect(() => {
-    const generateSteps = () => {
-      const steps: any[] = [];
-      
-      courses.forEach(c => {
-        const midFile = files.find(f => f.courseCode === c.code && f.type === 'midterm_overview');
-        steps.push({ agent: 'TopicExtractor', message: `Ingesting ${midFile?.name || 'overview'}...`, status: 'loading' });
-        steps.push({ agent: 'TopicExtractor', message: `Extracted 14 core topics for ${c.code}.`, status: 'success' });
-      });
+    if (startedRef.current) return;
+    startedRef.current = true;
 
-      courses.forEach(c => {
-        const textFile = files.find(f => f.courseCode === c.code && f.type === 'textbook');
-        steps.push({ agent: 'EffortEstimator', message: `Cross-referencing ${textFile?.name || 'textbook'} pages...`, status: 'loading' });
-        steps.push({ agent: 'EffortEstimator', message: `Assigned workload metrics to ${c.code}.`, status: 'success' });
-      });
+    const startPlanning = async () => {
+      try {
+        await fetch(`${API_BASE_URL}/api/plan`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            courses: courses.map(c => ({ id: c.id, code: c.code, name: c.name, examDate: c.examDate })),
+            constraints
+          })
+        });
+      } catch (err) {
+        console.error('Error starting plan:', err);
+        setError('Failed to connect to server. Is the backend running?');
+        return;
+      }
 
-      steps.push({ agent: 'Scheduler', message: `Applying user constraints: ${constraints.weekdayHours}h weekdays / ${constraints.weekendHours}h weekends.`, status: 'loading' });
-      steps.push({ agent: 'Scheduler', message: `Spaced repetition blocks inserted for all courses.`, status: 'success' });
+      // Use SSE for real-time streaming
+      const evtSource = new EventSource(`${API_BASE_URL}/api/plan/${sessionId}/stream`);
 
-      steps.push({ agent: 'QA_Guard', message: 'Validating plan integrity through Feb 27, 2026...', status: 'loading' });
-      steps.push({ agent: 'QA_Guard', message: 'Consistency check passed. Finalizing results.', status: 'success' });
+      evtSource.onmessage = (event) => {
+        try {
+          const log = JSON.parse(event.data);
 
-      return steps;
+          // Check for done signal
+          if (log._done) {
+            evtSource.close();
+
+            if (log.status === 'error') {
+              setError(log.message);
+              return;
+            }
+
+            // Fetch the final result
+            setProgress(100);
+            fetchResult();
+            return;
+          }
+
+          setLogs(prev => [...prev, log]);
+
+          // Update progress based on log count
+          const expectedSteps = (courses.length * 4) + 2; // 4 logs per course + 2 for orchestrator
+          setProgress(prev => {
+            const newProg = Math.min(90, ((prev / 100 * expectedSteps + 1) / expectedSteps) * 100);
+            return Math.max(prev, newProg);
+          });
+        } catch (e) {
+          console.error('Error parsing SSE data:', e);
+        }
+      };
+
+      evtSource.onerror = () => {
+        evtSource.close();
+        // Fallback to polling if SSE fails
+        startPolling();
+      };
+
+      const fetchResult = async () => {
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/plan/${sessionId}/result`);
+          if (response.ok) {
+            const result = await response.json();
+            if (Array.isArray(result)) {
+              setTimeout(() => onComplete(result), 1500);
+            } else if (result.error) {
+              setError(result.error);
+            }
+          }
+        } catch (err) {
+          console.error('Error fetching result:', err);
+        }
+      };
     };
 
-    const steps = generateSteps();
-    let currentStep = 0;
-    
-    const interval = setInterval(() => {
-      if (currentStep < steps.length) {
-        setLogs(prev => [...prev, { 
-          ...steps[currentStep], 
-          timestamp: new Date().toLocaleTimeString(),
-        } as AgentLog]);
-        setProgress(((currentStep + 1) / steps.length) * 100);
-        currentStep++;
-      } else {
-        clearInterval(interval);
-        
-        const mockPlan: StudyTask[] = [];
-        const today = new Date();
-        const endDate = new Date('2026-02-27');
-        const diffTime = Math.abs(endDate.getTime() - today.getTime());
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
-        for (let i = 0; i <= diffDays; i++) {
-          const currentDate = new Date(today);
-          currentDate.setDate(today.getDate() + i);
-          const dateStr = currentDate.toISOString().split('T')[0];
-          const isWeekend = currentDate.getDay() === 0 || currentDate.getDay() === 6;
-          const maxHours = isWeekend ? constraints.weekendHours : constraints.weekdayHours;
-          
-          const course = courses[i % courses.length];
-          mockPlan.push({
-            date: dateStr,
-            course: course.code,
-            courseColor: course.color,
-            topic: `Core Concept: ${['Fundamentals', 'Advanced Theory', 'Practical Application', 'Historical Context'][i % 4]}`,
-            task_type: i % 4 === 0 ? 'review' : (i % 2 === 0 ? 'practice' : 'learn'),
-            duration_hours: Math.min(maxHours, 1.5 + (i % 2)),
-            resources: `Refer to ${files.find(f => f.courseCode === course.code && f.type === 'textbook')?.name || 'Textbook'}`,
-            notes: `Validated against ${files.find(f => f.courseCode === course.code && f.type === 'midterm_overview')?.name || 'Overview Bullet points'}.`
-          });
+    // Polling fallback if SSE is unavailable
+    const startPolling = () => {
+      const logInterval = setInterval(async () => {
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/plan/${sessionId}/logs`);
+          if (response.ok) {
+            const newLogs = await response.json();
+            setLogs(newLogs);
+            const expectedSteps = (courses.length * 4) + 2;
+            const currentProgress = Math.min(95, (newLogs.length / expectedSteps) * 100);
+            setProgress(currentProgress);
+          }
+        } catch (err) {
+          console.error('Error fetching logs:', err);
         }
-        
-        setTimeout(() => onComplete(mockPlan), 1200);
-      }
-    }, 600);
+      }, 2000);
 
-    return () => clearInterval(interval);
-  }, [files, courses, constraints]);
+      const resultInterval = setInterval(async () => {
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/plan/${sessionId}/result`);
+          if (response.ok) {
+            const result = await response.json();
+            if (Array.isArray(result)) {
+              setProgress(100);
+              clearInterval(logInterval);
+              clearInterval(resultInterval);
+              setTimeout(() => onComplete(result), 1500);
+            } else if (result.error) {
+              setError(result.error);
+              clearInterval(logInterval);
+              clearInterval(resultInterval);
+            }
+          }
+        } catch (err) {
+          console.error('Error fetching result:', err);
+        }
+      }, 3000);
+    };
+
+    startPlanning();
+  }, [sessionId, courses, constraints, onComplete]);
 
   return (
     <div className="max-w-4xl mx-auto space-y-16 py-12 animate-in fade-in zoom-in-95 duration-700">
@@ -93,11 +162,15 @@ const PlanningView: React.FC<PlanningViewProps> = ({ onComplete, files, courses,
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#4a5d45] opacity-75"></span>
             <span className="relative inline-flex rounded-full h-2 w-2 bg-[#4a5d45]"></span>
           </span>
-          Orchestration In Progress
+          {error ? 'Pipeline Error' : progress >= 100 ? 'Complete' : 'Orchestration In Progress'}
         </div>
-        <h2 className="serif text-6xl font-bold text-[#4a5d45] tracking-tight">Synthesizing Strategy.</h2>
+        <h2 className="serif text-6xl font-bold text-[#4a5d45] tracking-tight">
+          {error ? 'Pipeline Failed.' : progress >= 100 ? 'Strategy Complete.' : 'Synthesizing Strategy.'}
+        </h2>
         <p className="text-gray-400 text-lg max-w-md mx-auto italic font-medium leading-relaxed">
-          The agent network is cross-referencing your documents to find the most efficient study path.
+          {error
+            ? 'An error occurred during agent processing. Check the terminal below for details.'
+            : 'The agent network is cross-referencing your documents to find the most efficient study path.'}
         </p>
       </div>
 
@@ -107,9 +180,11 @@ const PlanningView: React.FC<PlanningViewProps> = ({ onComplete, files, courses,
           <span className="serif text-2xl font-bold text-[#4a5d45]">{Math.round(progress)}%</span>
         </div>
         <div className="overflow-hidden h-2 flex rounded-full bg-gray-100 shadow-inner">
-          <div 
-            style={{ width: `${progress}%` }} 
-            className="flex flex-col text-center whitespace-nowrap text-white justify-center bg-[#4a5d45] transition-all duration-500 ease-out rounded-full shadow-lg shadow-[#4a5d45]/20"
+          <div
+            style={{ width: `${progress}%` }}
+            className={`flex flex-col text-center whitespace-nowrap text-white justify-center transition-all duration-500 ease-out rounded-full shadow-lg ${
+              error ? 'bg-red-500 shadow-red-500/20' : 'bg-[#4a5d45] shadow-[#4a5d45]/20'
+            }`}
           ></div>
         </div>
       </div>
@@ -121,21 +196,32 @@ const PlanningView: React.FC<PlanningViewProps> = ({ onComplete, files, courses,
           <div className="w-3 h-3 rounded-full bg-gray-800"></div>
           <span className="ml-4 text-gray-600 font-bold uppercase tracking-[0.2em]">Prep(x) Computational Terminal</span>
         </div>
-        <div className="space-y-5 h-[400px] overflow-y-auto scrollbar-hide pr-4 custom-scrollbar">
+        <div ref={terminalRef} className="space-y-5 h-[400px] overflow-y-auto scrollbar-hide pr-4 custom-scrollbar">
           {logs.map((log, i) => (
             <div key={i} className="flex gap-6 animate-in slide-in-from-bottom-2 duration-300">
               <span className="text-gray-600 shrink-0 font-medium opacity-50">[{log.timestamp}]</span>
               <div className="flex flex-col gap-1.5">
-                <span className={`font-bold uppercase tracking-[0.15em] ${
-                  log.agent === 'TopicExtractor' ? 'text-blue-400' :
-                  log.agent === 'EffortEstimator' ? 'text-emerald-400' :
-                  log.agent === 'Scheduler' ? 'text-amber-400' : 'text-slate-400'
-                }`}>{log.agent}</span>
-                <span className="text-gray-400 leading-relaxed font-medium">{log.message}</span>
+                <span className={`font-bold uppercase tracking-[0.15em] ${AGENT_COLORS[log.agent] || 'text-slate-400'}`}>
+                  {log.agent}
+                </span>
+                <span className={`leading-relaxed font-medium ${log.status === 'error' ? 'text-red-400' : 'text-gray-400'}`}>
+                  {log.message}
+                </span>
               </div>
+              {log.status === 'loading' && (
+                <span className="shrink-0 self-center">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+                </span>
+              )}
             </div>
           ))}
-          {logs.length < 10 && (
+          {!error && logs.length === 0 && (
+            <div className="flex gap-4 animate-pulse opacity-30 mt-4">
+              <span className="text-gray-600">[{new Date().toLocaleTimeString()}]</span>
+              <span className="text-gray-500 italic">Initializing agent network...</span>
+            </div>
+          )}
+          {!error && progress < 100 && logs.length > 0 && (
             <div className="flex gap-4 animate-pulse opacity-30 mt-4">
               <span className="text-gray-600">[{new Date().toLocaleTimeString()}]</span>
               <span className="text-gray-500 italic">Inter-agent negotiation ongoing...</span>
