@@ -1,0 +1,5 @@
+{
+  "name": "prep(x) Study Planner",
+  "description": "A minimalistic, multi-agent exam study planner that generates comprehensive day-by-day study schedules from course materials.",
+  "requestFramePermissions": []
+}
