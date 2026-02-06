@@ -6,6 +6,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
+from datetime import datetime, timedelta
 
 load_dotenv(dotenv_path="../.env.local")
 
@@ -252,6 +253,9 @@ class ChiefOrchestrator:
                 "topics": topics_summary
             })
         
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        
         prompt = f"""Create a comprehensive study schedule.
 
 COURSES:
@@ -261,7 +265,7 @@ CONSTRAINTS:
 - Weekday hours: {constraints.get('weekdayHours', 3)}
 - Weekend hours: {constraints.get('weekendHours', 6)}
 - No-study dates: {constraints.get('noStudyDates', [])}
-- Today: 2026-02-06. Start: 2026-02-07.
+- Today: {today_str}. Start: {tomorrow_str}.
 - Last study day = 1 day before exam
 
 RULES:
