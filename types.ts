@@ -30,7 +30,7 @@ export interface StudyTask {
   course: string;
   courseColor: string;
   topic: string;
-  task_type: 'learn' | 'practice' | 'review';
+  task_type: 'learn' | 'practice' | 'review' | 'rest';
   duration_hours: number;
   resources: string;
   notes: string;
