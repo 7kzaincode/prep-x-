@@ -14,7 +14,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from agents import SyllabusExpert, ExamScopeAnalyst, StudyGuideGuru, ChiefOrchestrator
+from agents import analyze_syllabus, analyze_exam_scope, analyze_textbook, generate_study_plan
 
 app = FastAPI(title="prep(x) API")
 
@@ -150,11 +150,6 @@ async def stream_logs(sessionId: str):
 async def run_agent_workflow(request: PlanRequest):
     sessionId = request.sessionId
 
-    syllabus_expert = SyllabusExpert()
-    scope_analyst = ExamScopeAnalyst()
-    guide_guru = StudyGuideGuru()
-    orchestrator = ChiefOrchestrator()
-
     # Build course color map from frontend data
     COURSE_COLORS = ['#4a5d45', '#8c7851', '#51688c', '#8c5151', '#518c86']
     course_color_map = {}
@@ -167,28 +162,23 @@ async def run_agent_workflow(request: PlanRequest):
     try:
         for idx, course in enumerate(request.courses):
             course_num = idx + 1
-            # Use course.id for directory lookups (immutable, matches upload path)
             course_dir_key = course.id
 
-            # 1. Syllabus analysis
-            add_log(sessionId, "SyllabusExpert", f"Uploading and analyzing syllabus for {course.code}...", "loading")
+            # 1. Syllabus analysis (ADK agent)
+            add_log(sessionId, "SyllabusExpert", f"Analyzing syllabus for {course.code}...", "loading")
             syllabus_dir = os.path.join(UPLOAD_DIR, sessionId, course_dir_key, "syllabus")
             syllabus_files = [os.path.join(syllabus_dir, f) for f in os.listdir(syllabus_dir)] if os.path.exists(syllabus_dir) else []
 
-            syllabus_info = await asyncio.to_thread(
-                syllabus_expert.analyze, syllabus_files
-            ) if syllabus_files else {"course_name": course.name}
+            syllabus_info = await analyze_syllabus(syllabus_files) if syllabus_files else {"course_name": course.name}
             modules = syllabus_info.get('modules', [])
             add_log(sessionId, "SyllabusExpert", f"Syllabus extracted for {course.code} — {len(modules)} modules identified.", "success")
 
-            # 2. Exam scope analysis
+            # 2. Exam scope analysis (ADK agent)
             add_log(sessionId, "ExamScopeAnalyst", f"Analyzing midterm overview for {course.code}...", "loading")
             overview_dir = os.path.join(UPLOAD_DIR, sessionId, course_dir_key, "midterm_overview")
             overview_files = [os.path.join(overview_dir, f) for f in os.listdir(overview_dir)] if os.path.exists(overview_dir) else []
 
-            scope_info = await asyncio.to_thread(
-                scope_analyst.analyze, overview_files
-            ) if overview_files else {"topics": []}
+            scope_info = await analyze_exam_scope(overview_files) if overview_files else {"topics": []}
             topics = scope_info.get("topics", [])
             topics_count = len(topics)
 
@@ -196,7 +186,6 @@ async def run_agent_workflow(request: PlanRequest):
             extracted_exam_date = scope_info.get("exam_date", "")
             if extracted_exam_date and extracted_exam_date.lower() in ("unknown", "n/a", "none", ""):
                 extracted_exam_date = ""
-            # Use manual override if provided, otherwise use extracted date
             resolved_exam_date = course.examDate if course.examDate else extracted_exam_date
             if resolved_exam_date:
                 add_log(sessionId, "ExamScopeAnalyst",
@@ -211,9 +200,9 @@ async def run_agent_workflow(request: PlanRequest):
                 for m in modules:
                     if isinstance(m, dict):
                         for t in m.get("topics", []):
-                            fallback_topics.append({"name": t, "importance": "medium", "question_types": [], "key_concepts": []})
+                            fallback_topics.append({"name": t, "importance": "medium"})
                         if not m.get("topics") and m.get("name"):
-                            fallback_topics.append({"name": m["name"], "importance": "medium", "question_types": [], "key_concepts": []})
+                            fallback_topics.append({"name": m["name"], "importance": "medium"})
                 if fallback_topics:
                     scope_info["topics"] = fallback_topics
                     topics = fallback_topics
@@ -227,25 +216,28 @@ async def run_agent_workflow(request: PlanRequest):
                 topic_preview += f" (+{topics_count - 4} more)"
             add_log(sessionId, "ExamScopeAnalyst", f"Exam scope for {course.code}: {topics_count} topics — {topic_preview}", "success")
 
-            # 3. Study guide / resource mapping (two-pass: TOC scan → relevant pages only)
-            add_log(sessionId, "StudyGuideGuru", f"Scanning textbook TOC for {course.code} to find relevant chapters...", "loading")
+            # 3. Textbook analysis — two-pass: TocNavigator → StudyGuideGuru (ADK agents with tools)
+            add_log(sessionId, "TocNavigator", f"Scanning textbook TOC for {course.code} to find relevant chapters...", "loading")
             textbook_dir = os.path.join(UPLOAD_DIR, sessionId, course_dir_key, "textbook")
             textbook_files = [os.path.join(textbook_dir, f) for f in os.listdir(textbook_dir)] if os.path.exists(textbook_dir) else []
 
-            guide_info = await asyncio.to_thread(
-                guide_guru.analyze, textbook_files, scope_info.get("topics", [])
-            ) if textbook_files else []
+            if textbook_files:
+                guide_info = await analyze_textbook(textbook_files, scope_info.get("topics", []))
+                add_log(sessionId, "TocNavigator", f"TOC scan complete for {course.code}.", "success")
+            else:
+                guide_info = []
+                add_log(sessionId, "TocNavigator", f"No textbook uploaded for {course.code} — skipping.", "success")
+
             guide_count = len(guide_info) if isinstance(guide_info, list) else 0
             total_hours = 0
             if isinstance(guide_info, list):
                 for g in guide_info:
                     if isinstance(g, dict):
                         total_hours += g.get("estimated_hours", 0)
-            add_log(sessionId, "StudyGuideGuru", f"Resource mapping for {course.code}: {guide_count} topics mapped, ~{total_hours:.1f}h estimated. Only exam-relevant pages extracted.", "success")
+            add_log(sessionId, "StudyGuideGuru", f"Resource mapping for {course.code}: {guide_count} topics mapped, ~{total_hours:.1f}h estimated.", "success")
 
             add_log(sessionId, "System", f"Course {course_num}/{total_courses} fully analyzed: {course.code}", "success")
 
-            # Include resolved exam date in course data for orchestrator
             course_dict = course.dict()
             course_dict["examDate"] = resolved_exam_date
 
@@ -256,15 +248,13 @@ async def run_agent_workflow(request: PlanRequest):
                 "guide": guide_info
             })
 
-        # Final orchestration
+        # Final orchestration (ADK agent)
         total_est = sum(
             sum(g.get("estimated_hours", 0) for g in cd.get("guide", []) if isinstance(g, dict))
             for cd in all_course_data
         )
         add_log(sessionId, "ChiefOrchestrator", f"Synthesizing schedule across {total_courses} courses (~{total_est:.0f}h of content)...", "loading")
-        final_plan = await asyncio.to_thread(
-            orchestrator.generate_plan, all_course_data, request.constraints.dict()
-        )
+        final_plan = await generate_study_plan(all_course_data, request.constraints.dict())
 
         # Inject courseColor into each task
         if isinstance(final_plan, list):
@@ -288,8 +278,9 @@ async def run_agent_workflow(request: PlanRequest):
     except Exception as e:
         error_msg = str(e)
         print(f"[ERROR] Agent workflow failed: {error_msg}")
+        import traceback
+        traceback.print_exc()
         add_log(sessionId, "System", f"Error: {error_msg}", "error")
-        # Store error as result so frontend stops polling
         session_results[sessionId] = {"error": error_msg}
         broadcast_log(sessionId, {
             "_done": True,

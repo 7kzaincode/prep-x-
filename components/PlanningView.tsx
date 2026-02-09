@@ -14,6 +14,7 @@ interface PlanningViewProps {
 const AGENT_COLORS: Record<string, string> = {
   SyllabusExpert: 'text-blue-400',
   ExamScopeAnalyst: 'text-emerald-400',
+  TocNavigator: 'text-cyan-400',
   StudyGuideGuru: 'text-amber-400',
   ChiefOrchestrator: 'text-purple-400',
   System: 'text-slate-400',

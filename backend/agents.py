@@ -1,18 +1,42 @@
 import os
 import json
+import uuid
 from typing import List, Dict, Any, Optional
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-from PyPDF2 import PdfReader
 from datetime import datetime, timedelta
 
-load_dotenv(dotenv_path="../.env.local")
+from google.adk.agents import LlmAgent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
 
-# Initialize Gemini Client
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env.local"))
+load_dotenv(dotenv_path=ENV_PATH)
+
+# ADK reads GOOGLE_API_KEY; alias from our env var
+if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
+
 MODEL_NAME = "gemini-2.5-flash"
+APP_NAME = "prep_x_study_planner"
+
+# Rate limiter — free tier is 5 RPM, need 13s between calls
+import asyncio
+import time
+_last_api_call = 0.0
+_RPM_DELAY = 13  # seconds between API calls (5 RPM = 12s min, 13s for safety)
+
+async def _rate_limit():
+    """Wait if needed to stay under the Gemini free-tier RPM limit."""
+    global _last_api_call
+    now = time.time()
+    elapsed = now - _last_api_call
+    if elapsed < _RPM_DELAY:
+        wait = _RPM_DELAY - elapsed
+        print(f"  [Rate limiter] Waiting {wait:.1f}s to stay under RPM limit...")
+        await asyncio.sleep(wait)
+    _last_api_call = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +70,6 @@ def extract_pages_by_ranges(path: str, page_ranges: List[Dict]) -> str:
     total = len(reader.pages)
     text_parts = []
     for pr in page_ranges:
-        # Convert 1-indexed to 0-indexed, clamp to bounds
         start = max(0, pr.get("start", 1) - 1)
         end = min(pr.get("end", start + 1), total)
         for i in range(start, end):
@@ -61,240 +84,407 @@ def get_total_pages(path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Gemini helper — text-only (no file uploads)
+# FunctionTool functions for StudyGuideGuru
 # ---------------------------------------------------------------------------
 
-def get_text_response(prompt: str) -> dict:
-    """Send a text-only prompt to Gemini (no file upload)."""
-    print(f"\n--- [AGENT CALL — text only] ---")
-    print(f"Prompt length: {len(prompt)} chars")
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        )
+def load_textbook_toc(textbook_path: str, max_pages: int = 15) -> str:
+    """Extract the table of contents (first N pages) from a textbook PDF.
+
+    Args:
+        textbook_path: Absolute path to the textbook PDF file.
+        max_pages: Number of pages from the start to extract (default 15).
+
+    Returns:
+        Extracted text from the first N pages containing the table of contents.
+    """
+    if not os.path.exists(textbook_path):
+        return f"Error: file not found at {textbook_path}"
+    total = get_total_pages(textbook_path)
+    text = extract_toc_text(textbook_path, max_pages)
+    return f"[Textbook: {total} total pages]\n{text}"
+
+
+def load_textbook_pages(textbook_path: str, page_ranges_json: str) -> str:
+    """Extract specific page ranges from a textbook PDF.
+
+    Args:
+        textbook_path: Absolute path to the textbook PDF file.
+        page_ranges_json: JSON string of page ranges, e.g. '[{"start": 45, "end": 48}]'.
+            Pages are 1-indexed. Each range is clamped to max 3 pages to save tokens.
+
+    Returns:
+        Extracted text from the specified page ranges.
+    """
+    if not os.path.exists(textbook_path):
+        return f"Error: file not found at {textbook_path}"
+    page_ranges = json.loads(page_ranges_json)
+    clamped = []
+    for pr in page_ranges:
+        start = pr.get("start", 1)
+        end = min(start + 3, pr.get("end", start + 3))
+        clamped.append({"start": start, "end": end})
+    text = extract_pages_by_ranges(textbook_path, clamped)
+    if len(text) > 15000:
+        text = text[:15000] + "\n[...truncated...]"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# ADK Agent definitions
+# ---------------------------------------------------------------------------
+
+syllabus_expert = LlmAgent(
+    name="SyllabusExpert",
+    model=MODEL_NAME,
+    instruction=(
+        "You are a syllabus analysis expert. Analyze the provided syllabus text and extract course structure.\n"
+        "Extract ONLY:\n"
+        "1. Course name and code\n"
+        "2. Up to 10 modules (max 3 topics each)\n"
+        "3. Exam dates and weights\n\n"
+        "Return valid JSON with keys: course_name, course_code, modules (array of {name, topics, week}), "
+        "assessments (array of {type, weight, date}).\n"
+        "Be concise."
+    ),
+    generate_content_config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+    ),
+)
+
+exam_scope_analyst = LlmAgent(
+    name="ExamScopeAnalyst",
+    model=MODEL_NAME,
+    instruction=(
+        "You are an exam scope analyst. Analyze the provided exam guide/midterm overview text.\n"
+        "Extract ONLY:\n"
+        "1. Exam date (YYYY-MM-DD format)\n"
+        "2. Topics (max 15), each with importance (high/medium/low)\n\n"
+        "Return valid JSON with keys: exam_date, topics (array of {name, importance}).\n"
+        "Be concise."
+    ),
+    generate_content_config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+    ),
+)
+
+toc_navigator = LlmAgent(
+    name="TocNavigator",
+    model=MODEL_NAME,
+    instruction=(
+        "You are a textbook table-of-contents navigator. Given the TOC text from a textbook and "
+        "a list of exam topics, identify which chapters and page ranges are relevant to each topic.\n\n"
+        "Return valid JSON with key: relevant_sections (array of {chapter, start_page, end_page, covers_topics}).\n"
+        "Only include sections genuinely relevant to the exam topics."
+    ),
+    generate_content_config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+    ),
+)
+
+study_guide_guru = LlmAgent(
+    name="StudyGuideGuru",
+    model=MODEL_NAME,
+    instruction=(
+        "You are a study guide expert that maps exam topics to textbook resources.\n\n"
+        "You will be given exam topics, relevant TOC sections, and ALREADY SAMPLED textbook page content.\n"
+        "The sampled content is provided directly in the message — use it to map topics.\n"
+        "You have tools available (load_textbook_toc, load_textbook_pages) but ONLY call them if "
+        "the provided content is clearly insufficient. In most cases the provided text is enough.\n"
+        "Do NOT call tools unless absolutely necessary.\n\n"
+        "Return ONLY valid JSON (no markdown) with key: mappings (array of {topic, resource, estimated_hours}).\n"
+        "- resource MUST be specific chapter/section references like 'Ch 3.2-3.4 (pp. 45-67)'\n"
+        "- Do NOT use generic text like 'Textbook' or 'Notes'\n"
+        "- Use EXACT topic names as provided — do not rephrase\n"
+        "- estimated_hours should be realistic (0.5 to 4.0)"
+    ),
+    tools=[load_textbook_toc, load_textbook_pages],
+)
+
+chief_orchestrator = LlmAgent(
+    name="ChiefOrchestrator",
+    model=MODEL_NAME,
+    instruction=(
+        "You are the chief study planner. Synthesize all course analysis data into an optimal "
+        "day-by-day study schedule.\n\n"
+        "RULES:\n"
+        "- Don't exceed daily hour budget\n"
+        "- Prioritize high-importance topics\n"
+        "- Schedule 'learn' before 'practice' for each topic\n"
+        "- Include 'review' sessions before exams\n"
+        "- SPREAD TASKS EVENLY until the exam date — do NOT bunch them at the start\n"
+        "- Include REST DAYS (1 rest day every 4-6 days) to prevent burnout\n"
+        "- If schedule is too compressed, prioritize ONLY high/medium topics\n"
+        "- Use the estimated_hours provided for each topic — honor the time each topic needs\n"
+        "- A course with fewer topics does NOT mean less time per topic. "
+        "Complex topics (e.g. physics, math) need the full hours specified in the data.\n"
+        "- HARD DEADLINE: NEVER schedule ANY task for a course ON or AFTER its exam_date. "
+        "The LAST study day for each course MUST be the day BEFORE its exam_date. "
+        "If there's not enough time, drop low-importance topics — do NOT exceed the deadline.\n\n"
+        "Return ONLY a raw JSON object (no markdown, no ```). The JSON must have a 'tasks' key "
+        "containing an array. Each task object has these STRING fields:\n"
+        "  date (YYYY-MM-DD), course (code), topic, task_type (learn/practice/review), "
+        "  duration_hours (number), resources (string), notes (SINGLE flat string, NOT an object).\n\n"
+        "The notes field must be a SINGLE flat string with 4 pipe-separated sections:\n"
+        "  Focus: <what to study> | Practice: <specific problem types> | Memorize: <key formulas/definitions> | Self-Test: <how to verify understanding>\n"
+        "Each section MUST contain real, specific content derived from the actual topic and course material provided above.\n"
+        "Pull actual concepts, formulas, techniques, and terminology from the topics and resources you were given.\n"
+        "NEVER use filler like 'core concepts here', 'problem types here', or 'key formulas'. "
+        "Every word must be meaningful and specific to that topic.\n\n"
+        "Use the EXACT topic names and resource references provided — do not rephrase them.\n"
+        "Generate ALL tasks for ALL topics. Do not stop early."
+    ),
+    generate_content_config=types.GenerateContentConfig(
+        max_output_tokens=65536,
+        thinking_config=types.ThinkingConfig(thinking_budget=2048),
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Core ADK runner — isolated session per call
+# ---------------------------------------------------------------------------
+
+async def run_agent(agent: LlmAgent, user_message: str) -> dict:
+    """Run an ADK agent with a completely isolated session.
+
+    Creates a fresh InMemorySessionService per call so there is zero chance
+    of cross-agent session contamination.
+    """
+    session_service = InMemorySessionService()
+
+    runner = Runner(
+        agent=agent,
+        app_name=APP_NAME,
+        session_service=session_service,
     )
-    # Token tracking
-    usage = response.usage_metadata
-    if usage:
-        print(f"📊 Tokens — Input: {usage.prompt_token_count}, Output: {usage.candidates_token_count}, Total: {usage.total_token_count}")
-    print(f"Response: {response.text[:200]}...")
-    return json.loads(response.text)
 
+    call_id = uuid.uuid4().hex[:12]
+    user_id = f"user_{call_id}"
+    session_id = f"session_{call_id}"
 
-def get_file_response(prompt: str, file_paths: List[str]) -> dict:
-    """Send prompt with file uploads to Gemini (for syllabus/midterm — small docs)."""
-    print(f"\n--- [AGENT CALL — with files] ---")
-    print(f"Prompt length: {len(prompt)} chars")
-    contents = [prompt]
-    for fp in file_paths:
-        print(f"Uploading: {os.path.basename(fp)}")
-        uploaded = client.files.upload(file=fp)
-        contents.append(uploaded)
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        )
+    session = await session_service.create_session(
+        app_name=APP_NAME,
+        user_id=user_id,
+        session_id=session_id,
     )
-    # Token tracking
-    usage = response.usage_metadata
-    if usage:
-        print(f"📊 Tokens — Input: {usage.prompt_token_count}, Output: {usage.candidates_token_count}, Total: {usage.total_token_count}")
-    print(f"Response: {response.text[:200]}...")
-    return json.loads(response.text)
+
+    user_content = types.Content(
+        role="user",
+        parts=[types.Part(text=user_message)],
+    )
+
+    # Wait for rate limit before hitting the API
+    await _rate_limit()
+
+    final_text = ""
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=user_content,
+    ):
+        if hasattr(event, "usage_metadata") and event.usage_metadata:
+            u = event.usage_metadata
+            print(f"  [{agent.name}] Tokens — In: {getattr(u, 'prompt_token_count', '?')}, "
+                  f"Out: {getattr(u, 'candidates_token_count', '?')}")
+
+        if event.is_final_response() and event.content and event.content.parts:
+            final_text = "".join(p.text for p in event.content.parts if p.text)
+
+    # Try to parse the final response as JSON
+    if final_text:
+        try:
+            return json.loads(final_text)
+        except json.JSONDecodeError:
+            # Try extracting JSON from markdown code blocks
+            if "```json" in final_text:
+                json_block = final_text.split("```json")[1].split("```")[0].strip()
+                try:
+                    return json.loads(json_block)
+                except json.JSONDecodeError:
+                    pass
+            elif "```" in final_text:
+                json_block = final_text.split("```")[1].split("```")[0].strip()
+                try:
+                    return json.loads(json_block)
+                except json.JSONDecodeError:
+                    pass
+            print(f"  WARNING: Could not parse {agent.name} response as JSON")
+            print(f"  Response preview: {final_text[:300]}")
+            return {}
+
+    print(f"  WARNING: {agent.name} returned empty response")
+    return {}
 
 
 # ---------------------------------------------------------------------------
-# Agents
+# Public async wrapper functions (called by main.py)
 # ---------------------------------------------------------------------------
 
-class SyllabusExpert:
-    """Extracts course structure from syllabus (small doc — upload is fine)."""
-    def analyze(self, syllabus_paths: List[str]):
-        prompt = """Analyze this syllabus. Extract ONLY:
-1. Course name and code
-2. Up to 10 modules (max 3 topics each)
-3. Exam dates and weights
+async def analyze_syllabus(syllabus_paths: List[str]) -> dict:
+    """Run SyllabusExpert on locally-extracted PDF text."""
+    if not syllabus_paths:
+        return {"course_name": "", "modules": [], "assessments": []}
 
-Return JSON:
-{
-    "course_name": "...",
-    "course_code": "...",
-    "modules": [{"name": "...", "topics": ["t1", "t2"], "week": 1}],
-    "assessments": [{"type": "midterm", "weight": "30%", "date": "YYYY-MM-DD"}]
-}
+    all_text = []
+    for path in syllabus_paths:
+        text = extract_pdf_text(path)
+        all_text.append(f"--- {os.path.basename(path)} ---\n{text}")
+    combined = "\n\n".join(all_text)
 
-Be concise."""
-        return get_file_response(prompt, syllabus_paths)
+    print(f"\n--- [SyllabusExpert] PDF text: {len(combined)} chars ---")
+    result = await run_agent(syllabus_expert, f"Analyze this syllabus:\n\n{combined}")
 
-
-class ExamScopeAnalyst:
-    """Identifies testable topics from midterm overview (small doc — upload is fine)."""
-    def analyze(self, overview_paths: List[str]):
-        prompt = """Analyze this exam guide. Extract ONLY:
-1. Exam date
-2. Topics (max 15), each with importance (high/medium/low)
-
-Return JSON:
-{
-    "exam_date": "YYYY-MM-DD",
-    "topics": [{"name": "Topic", "importance": "high"}]
-}
-
-Be concise."""
-        return get_file_response(prompt, overview_paths)
+    if not isinstance(result, dict):
+        return {"course_name": "", "modules": [], "assessments": []}
+    return result
 
 
-class StudyGuideGuru:
-    """Two-pass approach: (1) TOC scan to find chapters, (2) minimal mapping."""
+async def analyze_exam_scope(overview_paths: List[str]) -> dict:
+    """Run ExamScopeAnalyst on locally-extracted PDF text."""
+    if not overview_paths:
+        return {"exam_date": "", "topics": []}
 
-    def analyze(self, textbook_paths: List[str], topics: List):
-        if not textbook_paths:
-            return []
+    all_text = []
+    for path in overview_paths:
+        text = extract_pdf_text(path)
+        all_text.append(f"--- {os.path.basename(path)} ---\n{text}")
+    combined = "\n\n".join(all_text)
 
-        # Normalize topic list
-        topic_names = []
-        for t in topics:
-            if isinstance(t, dict):
-                topic_names.append(t.get("name", str(t)))
-            else:
-                topic_names.append(str(t))
+    print(f"\n--- [ExamScopeAnalyst] PDF text: {len(combined)} chars ---")
+    result = await run_agent(exam_scope_analyst, f"Analyze this exam guide:\n\n{combined}")
 
-        textbook_path = textbook_paths[0]
-        total_pages = get_total_pages(textbook_path)
+    if not isinstance(result, dict):
+        return {"exam_date": "", "topics": []}
+    return result
 
-        # ---- PASS 1: TOC scan (first 15 pages only) ----
-        print(f"\n[StudyGuideGuru] Pass 1: Scanning TOC ({total_pages} total pages)...")
-        toc_text = extract_toc_text(textbook_path, max_pages=15)
 
-        toc_prompt = f"""Table of contents of a {total_pages}-page textbook.
+async def analyze_textbook(textbook_paths: List[str], topics: List) -> list:
+    """Two-pass textbook analysis: TocNavigator → StudyGuideGuru."""
+    if not textbook_paths:
+        return []
 
-EXAM TOPICS: {json.dumps(topic_names)}
+    topic_names = []
+    for t in topics:
+        if isinstance(t, dict):
+            topic_names.append(t.get("name", str(t)))
+        else:
+            topic_names.append(str(t))
 
-Identify chapters/page ranges for these topics ONLY.
+    if not topic_names:
+        return []
 
-Return JSON:
-{{
-    "relevant_sections": [
-        {{"chapter": "Ch 3: Probability", "start_page": 45, "end_page": 78, "covers_topics": ["Topic A"]}}
+    textbook_path = textbook_paths[0]
+    total_pages = get_total_pages(textbook_path)
+
+    # --- PASS 1: TocNavigator scans TOC ---
+    print(f"\n--- [TocNavigator] Scanning TOC ({total_pages} total pages) ---")
+    toc_text = extract_toc_text(textbook_path, max_pages=15)
+
+    toc_message = (
+        f"Table of contents of a {total_pages}-page textbook.\n\n"
+        f"EXAM TOPICS: {json.dumps(topic_names)}\n\n"
+        f"Identify chapters/page ranges for these topics ONLY.\n\n"
+        f"TOC:\n{toc_text}"
+    )
+
+    toc_result = await run_agent(toc_navigator, toc_message)
+    sections = toc_result.get("relevant_sections", [])
+    print(f"[TocNavigator] Found {len(sections)} relevant sections")
+
+    if not sections:
+        return [{"topic": t, "resource": "Textbook (section not identified)", "estimated_hours": 2.0}
+                for t in topic_names]
+
+    # --- PASS 2: StudyGuideGuru maps topics using pre-extracted pages ---
+    # Pre-extract pages here to avoid tool call round-trips (saves API calls for rate limit)
+    page_ranges = [
+        {"start": s.get("start_page", 1), "end": min(s.get("start_page", 1) + 3, s.get("end_page", 10))}
+        for s in sections
     ]
-}}
+    sampled_count = sum(pr["end"] - pr["start"] + 1 for pr in page_ranges)
+    print(f"\n--- [StudyGuideGuru] Mapping {len(topic_names)} topics, sampling {sampled_count} pages ---")
 
-TOC:
-{toc_text}"""
+    relevant_text = extract_pages_by_ranges(textbook_path, page_ranges)
+    if len(relevant_text) > 15000:
+        relevant_text = relevant_text[:15000] + "\n[...truncated...]"
 
-        toc_result = get_text_response(toc_prompt)
-        sections = toc_result.get("relevant_sections", [])
-        print(f"[StudyGuideGuru] Pass 1 done: {len(sections)} sections")
+    guide_message = (
+        f"Map exam topics to textbook resources.\n\n"
+        f"TOPICS: {json.dumps(topic_names)}\n\n"
+        f"RELEVANT SECTIONS (from table of contents analysis):\n"
+        f"{json.dumps(sections, indent=2)}\n\n"
+        f"SAMPLED TEXTBOOK CONTENT:\n{relevant_text}\n\n"
+        f"Map each topic to specific textbook resources with estimated study hours.\n"
+        f"Return JSON with a mappings array."
+    )
 
-        if not sections:
-            return [{"topic": t, "resource": "Unknown", "estimated_hours": 2.0} for t in topic_names]
+    guide_result = await run_agent(study_guide_guru, guide_message)
 
-        # ---- PASS 2: Sample 2-3 pages per section, minimal output ----
-        # Only sample first 3 pages of each section
-        page_ranges = [{"start": s.get("start_page", 1), "end": min(s.get("start_page", 1) + 3, s.get("end_page", 10))} for s in sections]
-
-        extracted_pages = sum(pr["end"] - pr["start"] + 1 for pr in page_ranges)
-        print(f"[StudyGuideGuru] Pass 2: Sampling {extracted_pages} pages (first 3 per section)")
-
-        relevant_text = extract_pages_by_ranges(textbook_path, page_ranges)
-
-        # Aggressive truncation
-        max_chars = 15000  # ~4K tokens
-        if len(relevant_text) > max_chars:
-            relevant_text = relevant_text[:max_chars] + "\n[...truncated...]"
-            print(f"[StudyGuideGuru] Truncated to {max_chars} chars")
-
-        detail_prompt = f"""Map exam topics to textbook resources.
-
-TOPICS: {json.dumps(topic_names)}
-
-Return ONLY:
-[
-    {{"topic": "...", "resource": "Ch 3.2-3.4 (pp. 45-67)", "estimated_hours": 2.0}}
-]
-
-TEXT:
-{relevant_text}"""
-
-        return get_text_response(detail_prompt)
+    if isinstance(guide_result, dict) and "mappings" in guide_result:
+        return guide_result["mappings"]
+    if isinstance(guide_result, list):
+        return guide_result
+    return []
 
 
-class ChiefOrchestrator:
-    """Synthesizes all agent outputs into an optimal day-by-day study schedule."""
-    def generate_plan(self, courses_data: List[Dict], constraints: Dict):
-        # Compress courses_data to minimal format
-        compressed = []
-        for cd in courses_data:
-            course = cd.get("course", {})
-            scope = cd.get("scope", {})
-            guide = cd.get("guide", [])
-            
-            topics_summary = []
-            for t in scope.get("topics", []):
-                name = t.get("name", str(t)) if isinstance(t, dict) else str(t)
-                importance = t.get("importance", "medium") if isinstance(t, dict) else "medium"
-                # Find matching resource from guide
-                resource = "Textbook"
-                hours = 2.0
-                for g in guide:
-                    if isinstance(g, dict) and g.get("topic", "").lower() == name.lower():
+async def generate_study_plan(courses_data: List[Dict], constraints: Dict) -> list:
+    """Run ChiefOrchestrator to generate the final study schedule."""
+    compressed = []
+    for cd in courses_data:
+        course = cd.get("course", {})
+        scope = cd.get("scope", {})
+        guide = cd.get("guide", [])
+
+        topics_summary = []
+        for t in scope.get("topics", []):
+            name = t.get("name", str(t)) if isinstance(t, dict) else str(t)
+            importance = t.get("importance", "medium") if isinstance(t, dict) else "medium"
+            resource = "Textbook"
+            hours = 2.0
+            # Match guide entries (case-insensitive + substring fallback)
+            for g in guide:
+                if isinstance(g, dict):
+                    g_topic = g.get("topic", "")
+                    if g_topic.lower() == name.lower() or name.lower() in g_topic.lower() or g_topic.lower() in name.lower():
                         resource = g.get("resource", "Textbook")
                         hours = g.get("estimated_hours", 2.0)
                         break
-                topics_summary.append({"topic": name, "importance": importance, "resource": resource, "hours": hours})
-            
-            compressed.append({
-                "code": course.get("code", "COURSE"),
-                "exam_date": scope.get("exam_date", course.get("examDate", "unknown")),
-                "topics": topics_summary
+            topics_summary.append({
+                "topic": name, "importance": importance,
+                "resource": resource, "hours": hours,
             })
-        
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        prompt = f"""Create a comprehensive study schedule.
 
-COURSES:
-{json.dumps(compressed)}
+        # Prefer the resolved examDate from main.py (already handles auto-detect + manual override)
+        exam_date = course.get("examDate", "") or scope.get("exam_date", "")
+        if exam_date and exam_date.lower() in ("unknown", "n/a", "none"):
+            exam_date = ""
 
-CONSTRAINTS:
-- Weekday hours: {constraints.get('weekdayHours', 3)}
-- Weekend hours: {constraints.get('weekendHours', 6)}
-- No-study dates: {constraints.get('noStudyDates', [])}
-- Today: {today_str}. Start: {tomorrow_str}.
-- Last study day = 1 day before exam
+        compressed.append({
+            "code": course.get("code", "COURSE"),
+            "exam_date": exam_date or "unknown",
+            "topics": topics_summary,
+        })
 
-RULES:
-- Don't exceed daily hour budget
-- Prioritize high-importance topics
-- Schedule "learn" before "practice" for each topic
-- Include "review" sessions before exams
-- SPREAD TASKS EVENLY until the exam date. Do NOT bunch them all at the start.
-- Include REST DAYS if the schedule allows (e.g. 1 rest day every 4-6 days) to prevent burnout.
-- If finding the schedule too compressed, reduce daily hours or prioritize ONLY high/medium topics.
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-NOTES FORMAT for each task - be specific and actionable:
-- Focus: What core concepts to understand deeply (be specific to the topic)
-- Practice: Specific problem types or exercises to work through
-- Memorize: Key formulas, definitions, or facts to commit to memory
-- Self-Test: How to verify understanding (explain to someone, solve without notes, etc.)
+    plan_message = (
+        f"Create a comprehensive study schedule.\n\n"
+        f"COURSES:\n{json.dumps(compressed)}\n\n"
+        f"CONSTRAINTS:\n"
+        f"- Weekday hours: {constraints.get('weekdayHours', 3)}\n"
+        f"- Weekend hours: {constraints.get('weekendHours', 6)}\n"
+        f"- No-study dates: {constraints.get('noStudyDates', [])}\n"
+        f"- Today: {today_str}. Start: {tomorrow_str}.\n"
+        f"- HARD STOP: Last study day for each course = 1 day BEFORE its exam_date. "
+        f"ZERO tasks allowed on or after exam_date.\n\n"
+        f"Return a JSON object with a 'tasks' key containing the array of study tasks."
+    )
 
-Return JSON array:
-[
-    {{
-        "date": "YYYY-MM-DD",
-        "course": "CODE",
-        "topic": "Topic Name",
-        "task_type": "learn",
-        "duration_hours": 2,
-        "resources": "Chapter X, Section Y (pp. Z)",
-        "notes": "Focus: [specific concept explanation] | Practice: [specific problem types] | Memorize: [specific formulas/definitions] | Self-Test: [specific verification method]"
-    }}
-]
+    result = await run_agent(chief_orchestrator, plan_message)
 
-Make the notes genuinely helpful for studying, not generic placeholders."""
-        return get_text_response(prompt)
+    if isinstance(result, dict) and "tasks" in result:
+        return result["tasks"]
+    if isinstance(result, list):
+        return result
+    return []

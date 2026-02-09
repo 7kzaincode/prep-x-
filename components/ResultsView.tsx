@@ -89,11 +89,10 @@ const ResultsView: React.FC<ResultsViewProps> = ({ plan: initialPlan }) => {
 
   const flaggedCount = useMemo(() => localPlan.filter(t => t.isFlagged).length, [localPlan]);
 
-  const updateTask = (topicId: string, updates: Partial<StudyTask>) => {
-    setLocalPlan(prev => prev.map(t => {
-      const id = `${t.course}-${t.topic}`;
-      return id === topicId ? { ...t, ...updates } : t;
-    }));
+  const taskId = (t: StudyTask) => `${t.course}-${t.topic}-${t.task_type}-${t.date}`;
+
+  const updateTask = (id: string, updates: Partial<StudyTask>) => {
+    setLocalPlan(prev => prev.map(t => taskId(t) === id ? { ...t, ...updates } : t));
   };
 
   // Filtered plan based on flag toggle
@@ -145,12 +144,16 @@ const ResultsView: React.FC<ResultsViewProps> = ({ plan: initialPlan }) => {
 
   const exportToCSV = () => {
     const headers = ['Date', 'Course', 'Topic', 'Task Type', 'Duration (H)', 'Resources', 'Notes'];
+    const csvEscape = (val: string | number) => {
+      const s = String(val);
+      return `"${s.replace(/"/g, '""')}"`;
+    };
     const rows = localPlan.map(t => [
-      t.date, t.course, t.topic, t.task_type, t.duration_hours,
-      `"${(t.resources || '').replace(/"/g, '""')}"`,
-      `"${(t.notes || '').replace(/"/g, '""')}"`
+      csvEscape(t.date), csvEscape(t.course), csvEscape(t.topic),
+      csvEscape(t.task_type), csvEscape(t.duration_hours),
+      csvEscape(t.resources || ''), csvEscape(t.notes || '')
     ]);
-    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const csvContent = [headers.map(csvEscape).join(','), ...rows.map(r => r.join(','))].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -195,7 +198,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({ plan: initialPlan }) => {
   // ---- Topic Detail Modal ----
   const TopicDebrief = () => {
     if (!selectedTopicId) return null;
-    const task = localPlan.find(t => `${t.course}-${t.topic}` === selectedTopicId);
+    const task = localPlan.find(t => taskId(t) === selectedTopicId);
     if (!task) return null;
 
     return (
@@ -290,7 +293,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({ plan: initialPlan }) => {
                 <div className="py-20 text-center border-2 border-dashed border-gray-100 rounded-[2.5rem]"><p className="serif text-xl text-gray-300">Nothing scheduled.</p></div>
               ) : (
                 tasks.map((t, idx) => (
-                  <div key={idx} onClick={() => { setSelectedDayDate(null); setSelectedTopicId(`${t.course}-${t.topic}`); }} className="group bg-white p-8 rounded-[2.5rem] border border-gray-50 shadow-sm hover:shadow-xl transition-all cursor-pointer relative overflow-hidden">
+                  <div key={idx} onClick={() => { setSelectedDayDate(null); setSelectedTopicId(taskId(t)); }} className="group bg-white p-8 rounded-[2.5rem] border border-gray-50 shadow-sm hover:shadow-xl transition-all cursor-pointer relative overflow-hidden">
                     <div className="absolute left-0 top-0 bottom-0 w-1.5" style={{ backgroundColor: t.courseColor }}></div>
                     <div className="flex items-center justify-between mb-4">
                       <div className="flex items-center gap-3">
@@ -401,7 +404,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({ plan: initialPlan }) => {
                 </div>
                 <div className="space-y-4 flex-1 relative z-10">
                   {courseData.topics.map((t, idx) => {
-                    const id = `${t.course}-${t.topic}`;
+                    const id = taskId(t);
                     return (
                       <div key={idx} className={`p-6 rounded-[2rem] border transition-all flex items-center justify-between group/item cursor-pointer ${t.isCompleted ? 'bg-gray-50 border-gray-100 opacity-40 grayscale' : t.isFlagged ? 'bg-red-50/30 border-red-100/50 hover:border-red-200 hover:bg-red-50/50 shadow-sm hover:scale-[1.03]' : 'bg-[#fdfdfb] border-gray-50 hover:border-[#a7b8a1] hover:bg-white shadow-sm hover:scale-[1.03]'}`} onClick={() => setSelectedTopicId(id)}>
                         <div className="flex items-center gap-5 min-w-0">
@@ -501,7 +504,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({ plan: initialPlan }) => {
               <div className="mb-10"><h3 className={`serif text-4xl font-bold transition-all duration-700 ${selectedDayDate === date ? 'text-[#4a5d45] translate-x-2' : 'text-gray-400'}`}>{new Date(date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</h3></div>
               <div className="grid gap-10">
                 {groupedPlan[date].map((task, idx) => {
-                  const id = `${task.course}-${task.topic}`;
+                  const id = taskId(task);
                   return (
                     <div key={idx} onClick={() => setSelectedTopicId(id)} className={`flex flex-col md:flex-row gap-10 p-12 rounded-[4rem] bg-white border transition-all group overflow-hidden relative cursor-pointer ${task.isCompleted ? 'opacity-40 border-gray-50' : task.isFlagged ? 'border-red-100 shadow-sm hover:shadow-2xl' : 'border-gray-50 hover:shadow-2xl shadow-sm'} ${selectedDayDate === date ? 'shadow-2xl ring-1 ring-[#4a5d45]/10' : ''}`}>
                       <div className="absolute left-0 top-0 bottom-0 w-2.5 transition-all group-hover:w-4" style={{ backgroundColor: task.courseColor }}></div>
